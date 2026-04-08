@@ -349,6 +349,19 @@ def build_skills_payload() -> dict:
     return {"items": items, "skills": items, "categories": ["All", "Productivity"], "total": len(items)}
 
 
+def build_skill_detail(slug: str) -> dict | None:
+    payload = build_skills_payload()
+    skill = next((item for item in payload["items"] if item.get("slug") == slug or item.get("id") == slug), None)
+    if not skill:
+        return None
+    return {
+        **skill,
+        "readme": skill.get("description") or "",
+        "status": "installed" if skill.get("installed") else "available",
+        "config": {},
+    }
+
+
 def find_session(session_id: str) -> tuple[list[dict], dict | None, int]:
     sessions = load_sessions()
     for index, session in enumerate(sessions):
@@ -359,6 +372,11 @@ def find_session(session_id: str) -> tuple[list[dict], dict | None, int]:
 
 def session_summary(session: dict) -> dict:
     messages = session.get("messages", [])
+    tool_call_count = 0
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            tool_call_count += len(tool_calls)
     return {
         "id": session["id"],
         "source": "hermes-cloud",
@@ -369,7 +387,7 @@ def session_summary(session: dict) -> dict:
         "ended_at": session.get("ended_at"),
         "end_reason": session.get("end_reason"),
         "message_count": len(messages),
-        "tool_call_count": 0,
+        "tool_call_count": tool_call_count,
         "input_tokens": session.get("input_tokens", 0),
         "output_tokens": session.get("output_tokens", 0),
         "parent_session_id": session.get("parent_session_id"),
@@ -825,6 +843,18 @@ async def _run_session_chat(session: dict, prompt: str, model: str | None, strea
         return await client.send(request_obj, stream=stream)
 
 
+def _normalize_tool_call(record: dict, fallback_id: str, fallback_name: str = "tool") -> dict:
+    function = record.get("function") if isinstance(record.get("function"), dict) else {}
+    return {
+        "id": str(record.get("id") or fallback_id),
+        "type": str(record.get("type") or "function"),
+        "function": {
+            "name": str(function.get("name") or record.get("name") or fallback_name),
+            "arguments": function.get("arguments") if "arguments" in function else record.get("arguments", ""),
+        },
+    }
+
+
 async def api_session_chat(request: Request):
     auth_error = require_auth(request)
     if auth_error:
@@ -846,10 +876,19 @@ async def api_session_chat(request: Request):
         return JSONResponse({"error": text.decode("utf-8", errors="replace")[:500]}, status_code=response.status_code)
     payload = response.json()
     assistant_text = ""
+    assistant_tool_calls: list[dict] = []
     choices = payload.get("choices", [])
     if choices and isinstance(choices[0], dict):
-        assistant_text = str(((choices[0].get("message") or {}) if isinstance(choices[0].get("message"), dict) else {}).get("content") or "")
+        message_payload = (choices[0].get("message") or {}) if isinstance(choices[0].get("message"), dict) else {}
+        assistant_text = str(message_payload.get("content") or "")
+        raw_tool_calls = message_payload.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            assistant_tool_calls = [
+                _normalize_tool_call(tc if isinstance(tc, dict) else {}, f"tool-{session['id']}-{idx}")
+                for idx, tc in enumerate(raw_tool_calls, start=1)
+            ]
     assistant_message = message_record(session["id"], "assistant", assistant_text, len(session_messages) + 1)
+    assistant_message["tool_calls"] = assistant_tool_calls
     session_messages.append(assistant_message)
     session["last_active"] = now_ts()
     session["updated_at"] = now_iso()
@@ -881,7 +920,9 @@ async def api_session_chat_stream(request: Request):
 
     async def event_stream():
         yield f"event: user_message\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'message': user_message})}\n\n"
+        yield f"event: message.started\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'message': {'id': f'assistant-{run_id}', 'role': 'assistant'}})}\n\n"
         assistant_chunks: list[str] = []
+        tool_call_state: dict[str, dict] = {}
         response = await _run_session_chat(session, message, model, stream=True)
         if not response.is_success:
             body_bytes = await response.aread()
@@ -908,17 +949,58 @@ async def api_session_chat_stream(request: Request):
                     text = delta.get("content")
                     if isinstance(text, str) and text:
                         assistant_chunks.append(text)
+                        yield f"event: assistant.delta\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'delta': text})}\n\n"
                         yield f"event: chunk\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'text': text})}\n\n"
+                    raw_tool_calls = delta.get("tool_calls")
+                    if isinstance(raw_tool_calls, list):
+                        for raw_tool in raw_tool_calls:
+                            if not isinstance(raw_tool, dict):
+                                continue
+                            index = str(raw_tool.get("index", len(tool_call_state)))
+                            existing = tool_call_state.get(index, {
+                                "id": f"{run_id}:tool:{index}",
+                                "function": {"name": "tool", "arguments": ""},
+                            })
+                            if isinstance(raw_tool.get("id"), str) and raw_tool["id"]:
+                                existing["id"] = raw_tool["id"]
+                            function = raw_tool.get("function") if isinstance(raw_tool.get("function"), dict) else {}
+                            existing_function = existing.get("function") if isinstance(existing.get("function"), dict) else {"name": "tool", "arguments": ""}
+                            if isinstance(function.get("name"), str) and function["name"]:
+                                existing_function["name"] = function["name"]
+                            if isinstance(function.get("arguments"), str):
+                                existing_function["arguments"] = f"{existing_function.get('arguments', '')}{function['arguments']}"
+                            existing["function"] = existing_function
+                            tool_call_state[index] = existing
+                            tool_payload = {
+                                "sessionKey": session["id"],
+                                "runId": run_id,
+                                "tool_call_id": existing["id"],
+                                "tool_name": existing_function.get("name") or "tool",
+                                "tool_call": existing,
+                                "args": existing_function.get("arguments") or "",
+                            }
+                            yield f"event: tool.pending\ndata: {json.dumps(tool_payload)}\n\n"
+                            yield f"event: tool.progress\ndata: {json.dumps({**tool_payload, 'delta': existing_function.get('arguments') or ''})}\n\n"
         assistant_text = "".join(assistant_chunks).strip()
         latest_sessions, latest_session, latest_index = find_session(session["id"])
         if latest_session is not None and latest_index >= 0:
             latest_messages = latest_session.setdefault("messages", [])
             assistant_message = message_record(session["id"], "assistant", assistant_text, len(latest_messages) + 1)
+            assistant_tool_calls = [
+                _normalize_tool_call(tool_call, tool_call.get("id", f"{run_id}:tool:{idx}"), str((tool_call.get("function") or {}).get("name") or "tool"))
+                for idx, tool_call in enumerate(tool_call_state.values(), start=1)
+            ]
+            assistant_message["tool_calls"] = assistant_tool_calls
             latest_messages.append(assistant_message)
             latest_session["last_active"] = now_ts()
             latest_session["updated_at"] = now_iso()
             latest_sessions[latest_index] = latest_session
             save_sessions(latest_sessions)
+            for tool_call in assistant_tool_calls:
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                yield f"event: tool.completed\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'tool_call_id': tool_call.get('id'), 'tool_name': function.get('name') or 'tool', 'tool_call': tool_call, 'args': function.get('arguments') or '', 'message': 'Tool call completed'})}\n\n"
+            yield f"event: assistant.completed\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'content': assistant_text})}\n\n"
+            yield f"event: run.completed\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'state': 'complete'})}\n\n"
             yield f"event: done\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'state': 'done', 'message': assistant_message})}\n\n"
         else:
             yield f"event: done\ndata: {json.dumps({'sessionKey': session['id'], 'runId': run_id, 'state': 'done'})}\n\n"
@@ -997,6 +1079,16 @@ async def api_skills(request: Request):
     if auth_error:
         return auth_error
     return JSONResponse(build_skills_payload())
+
+
+async def api_skill_detail(request: Request):
+    auth_error = require_auth(request)
+    if auth_error:
+        return auth_error
+    skill = build_skill_detail(request.path_params["skill_name"])
+    if not skill:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    return JSONResponse({"skill": skill})
 
 
 async def api_skill_categories(request: Request):
@@ -1153,6 +1245,7 @@ routes = [
     Route("/api/memory/write", api_memory_write, methods=["POST"]),
     Route("/api/memory/search", api_memory_search, methods=["GET"]),
     Route("/api/skills", api_skills, methods=["GET"]),
+    Route("/api/skills/{skill_name:str}", api_skill_detail, methods=["GET"]),
     Route("/api/skills/categories", api_skill_categories, methods=["GET"]),
     Route("/api/jobs", api_jobs, methods=["GET", "POST"]),
     Route("/api/jobs/{job_id:str}", api_job_detail, methods=["GET", "PATCH", "POST", "DELETE"]),
