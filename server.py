@@ -43,6 +43,7 @@ UI_ENV_KEYS = [
     "HERMES_MODEL_BASE_URL",
     "HERMES_MODEL_API_KEY",
     "OPENROUTER_API_KEY",
+    "GATEWAY_ALLOW_ALL_USERS",
     "TELEGRAM_BOT_TOKEN",
     "DISCORD_BOT_TOKEN",
     "SLACK_BOT_TOKEN",
@@ -85,10 +86,11 @@ def write_env(path: Path, values: dict[str, str]) -> None:
 
 def write_config(env_values: dict[str, str]) -> None:
     model = normalize_model_id(env_values.get("HERMES_MODEL", "moonshotai/kimi-k2.5"))
-    provider = env_values.get("HERMES_INFERENCE_PROVIDER", "auto")
+    provider = env_values.get("HERMES_INFERENCE_PROVIDER", "").strip() or ("openrouter" if env_values.get("OPENROUTER_API_KEY") else "auto")
     base_url = env_values.get("HERMES_MODEL_BASE_URL", "").strip()
     api_key = env_values.get("HERMES_MODEL_API_KEY", "").strip()
     api_server_key = env_values.get("API_SERVER_KEY", "").strip()
+    allow_all_users = str(env_values.get("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in {"1", "true", "yes"}
     lines = [
         "model:",
         f"  default: \"{model}\"",
@@ -107,8 +109,45 @@ def write_config(env_values: dict[str, str]) -> None:
     ])
     if api_server_key:
         lines.append(f"    key: \"{api_server_key}\"")
+    if allow_all_users:
+        lines.extend([
+            "gateway:",
+            "  allow_all_users: true",
+        ])
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text("\n".join(lines) + "\n")
+
+
+def _iter_process_cmdlines() -> list[tuple[int, str]]:
+    processes: list[tuple[int, str]] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except Exception:
+            continue
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "ignore").strip()
+        if cmdline:
+            processes.append((pid, cmdline))
+    return processes
+
+
+def terminate_stale_hermes_processes() -> None:
+    targets: list[int] = []
+    for pid, cmdline in _iter_process_cmdlines():
+        if "hermes gateway" in cmdline or "api_server" in cmdline:
+            targets.append(pid)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
 
 
 def build_synthetic_config(env_values: dict[str, str]) -> dict:
@@ -478,6 +517,7 @@ class GatewayManager:
         self.state = "stopped"
         self.stdout_handle = None
         self.stderr_handle = None
+        self._watch_task: asyncio.Task | None = None
 
     async def start(self):
         if self.process and self.process.returncode is None:
@@ -485,6 +525,7 @@ class GatewayManager:
         env_values = {**os.environ, **read_env(ENV_FILE)}
         write_config(env_values)
         self.state = "starting"
+        terminate_stale_hermes_processes()
         STATE_ROOT.mkdir(parents=True, exist_ok=True)
         if self.stdout_handle:
             self.stdout_handle.close()
@@ -499,6 +540,20 @@ class GatewayManager:
             env=env_values,
         )
         self.state = "running"
+        if self._watch_task:
+            self._watch_task.cancel()
+        self._watch_task = asyncio.create_task(self._watch_process())
+
+    async def _watch_process(self):
+        process = self.process
+        if not process:
+            return
+        try:
+            await process.wait()
+        except asyncio.CancelledError:
+            return
+        if self.process is process:
+            self.state = "stopped"
 
     async def stop(self):
         if not self.process or self.process.returncode is not None:
@@ -511,6 +566,10 @@ class GatewayManager:
             self.process.kill()
             await self.process.wait()
         self.state = "stopped"
+        self.process = None
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
         if self.stdout_handle:
             self.stdout_handle.close()
             self.stdout_handle = None
