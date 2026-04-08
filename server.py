@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
+from starlette.background import BackgroundTask
 from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, AuthenticationBackend, AuthenticationError, SimpleUser
 from starlette.middleware import Middleware
@@ -1246,21 +1247,33 @@ async def proxy_v1(request: Request):
         target = f"{target}?{request.url.query}"
     headers = {key: value for key, value in request.headers.items() if key.lower() != "host"}
     body = await request.body()
-    async with httpx.AsyncClient(timeout=None) as client:
+    client = httpx.AsyncClient(timeout=None)
+    try:
         upstream = await client.send(
             client.build_request(request.method, target, headers=headers, content=body),
             stream=True,
         )
-        response_headers = {
-            key: value for key, value in upstream.headers.items()
-            if key.lower() not in {"content-length", "transfer-encoding", "connection"}
-        }
-        return StreamingResponse(
-            upstream.aiter_raw(),
-            status_code=upstream.status_code,
-            headers=response_headers,
-            background=None,
-        )
+    except Exception:
+        await client.aclose()
+        raise
+
+    response_headers = {
+        key: value for key, value in upstream.headers.items()
+        if key.lower() not in {"content-length", "transfer-encoding", "connection"}
+    }
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        background=BackgroundTask(_close_upstream_stream, upstream, client),
+    )
+
+
+async def _close_upstream_stream(upstream: httpx.Response, client: httpx.AsyncClient):
+    try:
+        await upstream.aclose()
+    finally:
+        await client.aclose()
 
 
 @asynccontextmanager
