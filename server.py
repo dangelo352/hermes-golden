@@ -435,6 +435,31 @@ def session_summary(session: dict) -> dict:
     }
 
 
+def ensure_session_record(session_id: str, title: str | None = None, model: str | None = None) -> tuple[list[dict], dict, int]:
+    sessions, session, index = find_session(session_id)
+    if session is not None and index >= 0:
+        return sessions, session, index
+
+    session = {
+        "id": session_id,
+        "title": title or session_id,
+        "model": model or normalize_model_id(read_env(ENV_FILE).get("HERMES_MODEL")),
+        "started_at": now_ts(),
+        "ended_at": None,
+        "end_reason": None,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "parent_session_id": None,
+        "last_active": now_ts(),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "messages": [],
+    }
+    sessions.append(session)
+    save_sessions(sessions)
+    return sessions, session, len(sessions) - 1
+
+
 def message_record(session_id: str, role: str, content: str, msg_id: int | None = None) -> dict:
     return {
         "id": msg_id if msg_id is not None else now_ts() * 1000,
@@ -776,26 +801,7 @@ async def api_sessions_create(request: Request):
     session_id = str(body.get("id") or uuid4())
     title = str(body.get("title") or session_id)
     model = str(body.get("model") or normalize_model_id(read_env(ENV_FILE).get("HERMES_MODEL")))
-    sessions = load_sessions()
-    if any(session.get("id") == session_id for session in sessions):
-        return JSONResponse({"session": session_summary(next(session for session in sessions if session.get("id") == session_id))})
-    session = {
-        "id": session_id,
-        "title": title,
-        "model": model,
-        "started_at": now_ts(),
-        "ended_at": None,
-        "end_reason": None,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "parent_session_id": None,
-        "last_active": now_ts(),
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "messages": [],
-    }
-    sessions.append(session)
-    save_sessions(sessions)
+    _sessions, session, _index = ensure_session_record(session_id, title=title, model=model)
     return JSONResponse({"session": session_summary(session)})
 
 
@@ -919,10 +925,12 @@ async def api_session_chat(request: Request):
     auth_error = require_auth(request)
     if auth_error:
         return auth_error
-    sessions, session, index = find_session(request.path_params["session_id"])
-    if not session:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
     body = await request.json()
+    sessions, session, index = ensure_session_record(
+        request.path_params["session_id"],
+        title=str(body.get("title") or request.path_params["session_id"]),
+        model=str(body.get("model") or "").strip() or None,
+    )
     message = str(body.get("message") or "").strip()
     model = str(body.get("model") or session.get("model") or "").strip() or None
     if not message:
@@ -961,10 +969,12 @@ async def api_session_chat_stream(request: Request):
     auth_error = require_auth(request)
     if auth_error:
         return auth_error
-    sessions, session, index = find_session(request.path_params["session_id"])
-    if not session:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
     body = await request.json()
+    sessions, session, index = ensure_session_record(
+        request.path_params["session_id"],
+        title=str(body.get("title") or request.path_params["session_id"]),
+        model=str(body.get("model") or "").strip() or None,
+    )
     message = str(body.get("message") or "").strip()
     model = str(body.get("model") or session.get("model") or "").strip() or None
     if not message:
